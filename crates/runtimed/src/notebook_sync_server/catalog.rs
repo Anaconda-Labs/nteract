@@ -20,6 +20,15 @@ pub(crate) struct RoomCreationOptions<'a> {
     pub blob_store: Arc<BlobStore>,
     pub ephemeral: bool,
     pub trusted_packages: crate::trusted_packages::TrustedPackageStore,
+    /// The room replicates a hosted cloud notebook through the hosted bridge.
+    ///
+    /// Its NotebookDoc and RuntimeStateDoc start from their canonical schema
+    /// seeds only. Fresh local documents would also carry identity writes
+    /// (`notebook_id`, `runtime_state_doc_id`, `comms_doc_id`) authored by the
+    /// daemon's own actors, which the bridge would then sync to the hosted
+    /// room, where the cloud identity is authoritative and a bare `runtimed`
+    /// actor is rejected.
+    pub hosted_replica: bool,
 }
 
 /// Look up an open room by its canonical .ipynb path.
@@ -81,6 +90,17 @@ pub async fn get_or_create_room_result(
         options.ephemeral,
         options.trusted_packages,
     )?);
+    if options.hosted_replica {
+        // Not yet published to the registry, so no peer can observe the swap.
+        *room.doc.write().await = notebook_doc::NotebookDoc::bootstrap(
+            notebook_doc::TextEncoding::UnicodeCodePoint,
+            "runtimed",
+        );
+        room.state.with_doc(|state| {
+            *state = runtime_doc::RuntimeStateDoc::try_new_empty()?;
+            Ok(())
+        })?;
+    }
     if path_for_room.is_none() {
         path_for_room = room.file_binding.path().await;
     }

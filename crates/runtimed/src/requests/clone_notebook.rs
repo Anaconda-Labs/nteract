@@ -73,6 +73,7 @@ pub(crate) async fn handle_inner(
             blob_store,
             ephemeral: true,
             trusted_packages: source_room.trusted_packages.clone(),
+            hosted_replica: false,
         },
     )
     .await

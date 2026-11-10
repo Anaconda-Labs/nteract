@@ -3498,6 +3498,7 @@ impl Daemon {
                                 blob_store: self.blob_store.clone(),
                                 ephemeral: false,
                                 trusted_packages: self.trusted_packages.clone(),
+                                hosted_replica: false,
                             },
                         )
                         .await?
@@ -3514,6 +3515,7 @@ impl Daemon {
                                 blob_store: self.blob_store.clone(),
                                 ephemeral: false, // NotebookSync handshake is always persistent
                                 trusted_packages: self.trusted_packages.clone(),
+                                hosted_replica: false,
                             },
                         )
                         .await?
@@ -3620,6 +3622,7 @@ impl Daemon {
                                 blob_store: self.blob_store.clone(),
                                 ephemeral: false,
                                 trusted_packages: self.trusted_packages.clone(),
+                                hosted_replica: false,
                             },
                         )
                         .await?
@@ -3662,14 +3665,36 @@ impl Daemon {
 
                 // Convert working_dir String to PathBuf
                 let working_dir_path = working_dir.map(std::path::PathBuf::from);
-                let connection_scope =
-                    local_connection_scope_for_path(room.file_binding.path().await.as_deref());
-                let connection_identity =
+                let connection_identity = if room.is_hosted() {
+                    // A UUID attach can land on a hosted-bridged room (for
+                    // example a desktop window attaching to the room `runt
+                    // cloud open` created). Its peers must author under the
+                    // cloud principal, like OpenHostedNotebook peers, or the
+                    // hosted room rejects their changes.
+                    let Some(principal) = self.hosted_bridge_principal(room.id).await else {
+                        let mut writer = writer;
+                        send_error_response(
+                            &mut writer,
+                            format!("Hosted room {} has no connected cloud bridge", room.id),
+                            typed_bootstrap.unwrap_or(false),
+                        )
+                        .await?;
+                        return Ok(());
+                    };
+                    crate::notebook_sync_server::RoomConnectionIdentity::hosted_bridged(
+                        &principal,
+                        operator,
+                        nteract_identity::ConnectionScope::Editor,
+                    )?
+                } else {
+                    let connection_scope =
+                        local_connection_scope_for_path(room.file_binding.path().await.as_deref());
                     crate::notebook_sync_server::RoomConnectionIdentity::local_with_scope(
                         operator,
                         connection_scope,
                     )
-                    .await?;
+                    .await?
+                };
                 crate::notebook_sync_server::handle_notebook_sync_connection(
                     reader,
                     writer,
@@ -3948,6 +3973,7 @@ impl Daemon {
                 blob_store: self.blob_store.clone(),
                 ephemeral: true,
                 trusted_packages: self.trusted_packages.clone(),
+                hosted_replica: true,
             },
         )
         .await
@@ -3998,6 +4024,21 @@ impl Daemon {
             }
         };
         Ok((room, bridge, connection_reservation))
+    }
+
+    /// Cloud principal of the hosted bridge serving `room_id`, waiting briefly
+    /// for a bridge that has not finished its first connect.
+    async fn hosted_bridge_principal(&self, room_id: uuid::Uuid) -> Option<String> {
+        let bridge = {
+            let bridges = self.hosted_bridges.lock().await;
+            bridges
+                .values()
+                .find(|bridge| bridge.room_id == room_id)
+                .cloned()
+        }?;
+        bridge
+            .wait_for_principal(std::time::Duration::from_secs(30))
+            .await
     }
 
     /// Handle an OpenHostedNotebook connection: attach (or reuse) the hosted
@@ -4571,6 +4612,7 @@ impl Daemon {
                     blob_store: self.blob_store.clone(),
                     ephemeral: false, // OpenNotebook handshake is always persistent
                     trusted_packages: self.trusted_packages.clone(),
+                    hosted_replica: false,
                 },
             )
             .await?
@@ -4861,6 +4903,7 @@ impl Daemon {
                 blob_store: self.blob_store.clone(),
                 ephemeral,
                 trusted_packages: self.trusted_packages.clone(),
+                hosted_replica: false,
             },
         )
         .await?;
@@ -9302,6 +9345,7 @@ mod tests {
                 blob_store: daemon.blob_store.clone(),
                 ephemeral: false,
                 trusted_packages: daemon.trusted_packages.clone(),
+                hosted_replica: false,
             },
         )
         .await
@@ -9855,6 +9899,7 @@ mod tests {
                     blob_store: daemon.blob_store.clone(),
                     ephemeral: false,
                     trusted_packages: daemon.trusted_packages.clone(),
+                    hosted_replica: false,
                 },
             )
             .await
@@ -9891,6 +9936,7 @@ mod tests {
                 blob_store: restarted.blob_store.clone(),
                 ephemeral: false,
                 trusted_packages: restarted.trusted_packages.clone(),
+                hosted_replica: false,
             },
         )
         .await

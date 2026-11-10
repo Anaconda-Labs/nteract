@@ -1229,6 +1229,7 @@ mod tests {
                     blob_store: daemon.blob_store.clone(),
                     ephemeral: true,
                     trusted_packages: daemon.trusted_packages.clone(),
+                    hosted_replica: false,
                 },
             )
             .await

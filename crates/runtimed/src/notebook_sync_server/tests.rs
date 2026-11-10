@@ -1020,6 +1020,7 @@ async fn test_get_or_create_room_reuses_existing() {
             blob_store: blob_store.clone(),
             ephemeral: false,
             trusted_packages: test_trusted_packages(),
+            hosted_replica: false,
         },
     )
     .await;
@@ -1033,12 +1034,64 @@ async fn test_get_or_create_room_reuses_existing() {
             blob_store,
             ephemeral: false,
             trusted_packages: test_trusted_packages(),
+            hosted_replica: false,
         },
     )
     .await;
 
     // Should be the same Arc (same room)
     assert!(Arc::ptr_eq(&room1, &room2));
+}
+
+#[tokio::test]
+async fn hosted_replica_room_has_only_schema_seed_changes() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let rooms: NotebookRooms = Arc::new(RoomRegistry::new());
+    let (room, _guard) = get_or_create_room(
+        &rooms,
+        Uuid::new_v4(),
+        RoomCreationOptions {
+            path: None,
+            initial_load_execution_store_dir: None,
+            docs_dir: tmp.path(),
+            blob_store: test_blob_store(&tmp),
+            ephemeral: true,
+            trusted_packages: test_trusted_packages(),
+            hosted_replica: true,
+        },
+    )
+    .await;
+
+    let notebook_actors: std::collections::BTreeSet<String> = {
+        let mut doc = room.doc.write().await;
+        doc.doc_mut()
+            .get_changes(&[])
+            .iter()
+            .map(|change| String::from_utf8_lossy(change.actor_id().to_bytes()).into_owned())
+            .collect()
+    };
+    assert_eq!(
+        notebook_actors,
+        ["nteract:notebook-schema:v5".to_string()].into(),
+        "hosted replica NotebookDoc must not carry daemon-authored changes"
+    );
+
+    let state_actors: std::collections::BTreeSet<String> = room
+        .state
+        .with_doc(|state| {
+            Ok(state
+                .doc_mut()
+                .get_changes(&[])
+                .iter()
+                .map(|change| String::from_utf8_lossy(change.actor_id().to_bytes()).into_owned())
+                .collect())
+        })
+        .unwrap();
+    assert_eq!(
+        state_actors,
+        ["nteract:runtime-state-schema:v2".to_string()].into(),
+        "hosted replica RuntimeStateDoc must not carry daemon-authored changes"
+    );
 }
 
 #[tokio::test]
@@ -1059,6 +1112,7 @@ async fn file_load_is_pending_before_room_becomes_observable() {
             blob_store,
             ephemeral: false,
             trusted_packages: test_trusted_packages(),
+            hosted_replica: false,
         },
     )
     .await;
@@ -1164,6 +1218,7 @@ async fn matching_recovery_journal_restores_room_without_source_regeneration() {
             blob_store,
             ephemeral: false,
             trusted_packages: test_trusted_packages(),
+            hosted_replica: false,
         },
     )
     .await;
@@ -1259,6 +1314,7 @@ async fn idless_durably_staged_recovery_rebuilds_sidecars_with_stable_identities
             blob_store,
             ephemeral: false,
             trusted_packages: test_trusted_packages(),
+            hosted_replica: false,
         },
     )
     .await;
@@ -1324,6 +1380,7 @@ async fn fresh_projection_captures_imported_runtime_sidecar_heads() {
             blob_store: test_blob_store(&tmp),
             ephemeral: false,
             trusted_packages: test_trusted_packages(),
+            hosted_replica: false,
         },
     )
     .await;
@@ -1398,6 +1455,7 @@ async fn peer_only_pending_recovery_never_regenerates_or_reports_ready() {
             blob_store,
             ephemeral: false,
             trusted_packages: test_trusted_packages(),
+            hosted_replica: false,
         },
     )
     .await;
@@ -1464,6 +1522,7 @@ async fn pending_recovery_without_peer_changes_safely_imports_disk() {
             blob_store,
             ephemeral: false,
             trusted_packages: test_trusted_packages(),
+            hosted_replica: false,
         },
     )
     .await;
@@ -1573,6 +1632,7 @@ async fn room_restart_finalizes_checkpoint_when_intended_file_replacement_landed
             blob_store,
             ephemeral: false,
             trusted_packages: test_trusted_packages(),
+            hosted_replica: false,
         },
     )
     .await;
@@ -1761,6 +1821,7 @@ async fn uuid_only_restart_attach_recovers_manifest_path_without_false_conflict(
             blob_store,
             ephemeral: false,
             trusted_packages: test_trusted_packages(),
+            hosted_replica: false,
         },
     )
     .await;
@@ -1800,6 +1861,7 @@ async fn test_get_or_create_room_different_notebooks() {
             blob_store: blob_store.clone(),
             ephemeral: false,
             trusted_packages: test_trusted_packages(),
+            hosted_replica: false,
         },
     )
     .await;
@@ -1813,6 +1875,7 @@ async fn test_get_or_create_room_different_notebooks() {
             blob_store,
             ephemeral: false,
             trusted_packages: test_trusted_packages(),
+            hosted_replica: false,
         },
     )
     .await;
@@ -2744,6 +2807,7 @@ async fn materialized_room_from_disk_with(
             blob_store,
             ephemeral: false,
             trusted_packages: test_trusted_packages(),
+            hosted_replica: false,
         },
     )
     .await;
@@ -8272,6 +8336,7 @@ async fn test_notebook_sync_path_handshake_reuses_existing_room() {
                 blob_store: blob_store.clone(),
                 ephemeral: false,
                 trusted_packages: test_trusted_packages(),
+                hosted_replica: false,
             },
         )
         .await
@@ -8294,6 +8359,7 @@ async fn test_notebook_sync_path_handshake_reuses_existing_room() {
                 blob_store: blob_store.clone(),
                 ephemeral: false,
                 trusted_packages: test_trusted_packages(),
+                hosted_replica: false,
             },
         )
         .await
@@ -11964,6 +12030,7 @@ async fn test_clone_as_ephemeral_forks_cells_and_clears_outputs() {
             blob_store: blob_store.clone(),
             ephemeral: false,
             trusted_packages: test_trusted_packages(),
+            hosted_replica: false,
         },
     )
     .await;
@@ -12279,6 +12346,7 @@ async fn test_clone_as_ephemeral_carries_unknown_metadata_extras() {
             blob_store: blob_store.clone(),
             ephemeral: false,
             trusted_packages: test_trusted_packages(),
+            hosted_replica: false,
         },
     )
     .await;
