@@ -287,7 +287,7 @@ pub(crate) async fn publish_or_warn(
     }
 }
 
-fn apply_auth_headers(
+pub(crate) fn apply_auth_headers(
     request: reqwest::RequestBuilder,
     auth: &CloudAuth,
 ) -> reqwest::RequestBuilder {
@@ -305,7 +305,7 @@ fn apply_auth_headers(
     }
 }
 
-fn blob_upload_url(cloud_url: &str, notebook_id: &str, hash: &str) -> String {
+pub(crate) fn blob_upload_url(cloud_url: &str, notebook_id: &str, hash: &str) -> String {
     format!(
         "{}/api/n/{}/blobs/{}",
         cloud_url.trim_end_matches('/'),

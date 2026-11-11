@@ -1690,6 +1690,8 @@ pub struct Daemon {
     /// the cloud instead of local kernels (see `requests::handle_notebook_request`).
     pub(crate) hosted_bridges:
         Mutex<HashMap<String, Arc<crate::notebook_sync_server::HostedBridgeHandle>>>,
+    /// HTTP client for reading hosted notebook blobs on a local miss.
+    hosted_blob_client: reqwest::Client,
     rooms_ever_seen: std::sync::atomic::AtomicBool,
     uv_warming_respawns: std::sync::atomic::AtomicU32,
     conda_warming_respawns: std::sync::atomic::AtomicU32,
@@ -2055,6 +2057,7 @@ impl Daemon {
             started_at: chrono::Utc::now(),
             notebook_rooms: Arc::new(RoomRegistry::new()),
             hosted_bridges: Mutex::new(HashMap::new()),
+            hosted_blob_client: reqwest::Client::new(),
             rooms_ever_seen: std::sync::atomic::AtomicBool::new(false),
             uv_warming_respawns: std::sync::atomic::AtomicU32::new(0),
             conda_warming_respawns: std::sync::atomic::AtomicU32::new(0),
@@ -3804,6 +3807,26 @@ impl Daemon {
         bridges.values().find(|b| b.room_id == room_id).cloned()
     }
 
+    /// Fetch a blob missing from the local store from the hosted notebooks
+    /// this daemon bridges. Blobs are content-addressed, so whichever bridge
+    /// has the hash serves the right bytes. Returns `true` once it is local.
+    pub(crate) async fn fetch_hosted_blob(&self, hash: &str) -> bool {
+        let bridges: Vec<_> = {
+            let bridges = self.hosted_bridges.lock().await;
+            bridges.values().cloned().collect()
+        };
+        if bridges.is_empty() {
+            return false;
+        }
+        let client = self.hosted_blob_client.clone();
+        for bridge in bridges {
+            if bridge.fetch_blob(&client, hash, &self.blob_store).await {
+                return true;
+            }
+        }
+        false
+    }
+
     pub(crate) async fn teardown_hosted_bridge(&self, locator: &str) {
         let handle = {
             let bridges = self.hosted_bridges.lock().await;
@@ -4000,6 +4023,7 @@ impl Daemon {
         let bridge = match bridges.entry(locator.clone()) {
             std::collections::hash_map::Entry::Occupied(entry) => entry.get().clone(),
             std::collections::hash_map::Entry::Vacant(entry) => {
+                let blob_auth = auth.clone();
                 let transport = notebook_cloud_transport::CloudWsFrameTransport::new(
                     notebook_cloud_transport::CloudWsConfig {
                         cloud_url: domain_config.base_url.clone(),
@@ -4009,18 +4033,26 @@ impl Daemon {
                         // when its ACL grants less, reports the result in
                         // cloud_room_ready, and local peers inherit that scope.
                         scope: "owner".to_string(),
-                        auth,
+                        auth: auth.clone(),
                         workstation: None,
                     },
                 );
-                let handle = Arc::new(crate::notebook_sync_server::spawn_hosted_bridge(
-                    room.clone(),
-                    transport,
-                    locator.clone(),
-                    hosted_id.clone(),
-                    guard,
-                    bridge_options,
-                ));
+                let handle = Arc::new(
+                    crate::notebook_sync_server::spawn_hosted_bridge(
+                        room.clone(),
+                        transport,
+                        locator.clone(),
+                        hosted_id.clone(),
+                        guard,
+                        bridge_options,
+                    )
+                    .with_blob_source(
+                        crate::notebook_sync_server::HostedBlobSource {
+                            cloud_url: domain_config.base_url.clone(),
+                            auth: blob_auth,
+                        },
+                    ),
+                );
                 entry.insert(handle.clone());
                 handle
             }

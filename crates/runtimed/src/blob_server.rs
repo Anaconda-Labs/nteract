@@ -116,6 +116,7 @@ async fn start_blob_server_with_listener(
 
     info!("[blob-server] Listening on http://127.0.0.1:{}", port);
 
+    let accept_daemon = daemon.clone();
     spawn_supervised(
         "blob-accept-loop",
         async move {
@@ -123,9 +124,12 @@ async fn start_blob_server_with_listener(
                 match listener.accept().await {
                     Ok((stream, _)) => {
                         let store = store.clone();
+                        let daemon = accept_daemon.clone();
                         let io = TokioIo::new(stream);
                         spawn_best_effort("blob-connection", async move {
-                            let service = service_fn(move |req| handle_request(req, store.clone()));
+                            let service = service_fn(move |req| {
+                                handle_request(req, store.clone(), daemon.clone())
+                            });
                             if let Err(e) =
                                 http1::Builder::new().serve_connection(io, service).await
                             {
@@ -178,6 +182,7 @@ async fn bind_preferred_or_random() -> std::io::Result<TcpListener> {
 async fn handle_request(
     req: Request<hyper::body::Incoming>,
     store: Arc<BlobStore>,
+    daemon: Option<Arc<Daemon>>,
 ) -> Result<Response<ResponseBody>, Infallible> {
     let path = req.uri().path();
     let method = req.method();
@@ -189,7 +194,19 @@ async fn handle_request(
     } else if path == OUTPUT_FRAME_PATH {
         output_frame_response()
     } else if let Some(hash) = path.strip_prefix("/blob/") {
-        serve_blob(&store, hash).await
+        let response = serve_blob(&store, hash).await;
+        // Outputs of a hosted-bridged notebook reference blobs stored in the
+        // cloud; fetch through on a miss so local windows can render them.
+        match daemon {
+            Some(daemon)
+                if response.status() == StatusCode::NOT_FOUND
+                    && is_blob_hash(hash)
+                    && daemon.fetch_hosted_blob(hash).await =>
+            {
+                serve_blob(&store, hash).await
+            }
+            _ => response,
+        }
     } else if let Some(name) = path.strip_prefix("/renderer-plugins/") {
         serve_raw_renderer_plugin(name).await
     } else if let Some(name) = path.strip_prefix("/plugins/") {
@@ -219,6 +236,10 @@ fn output_frame_response() -> Response<ResponseBody> {
         .unwrap_or_else(|_| {
             text_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error")
         })
+}
+
+fn is_blob_hash(hash: &str) -> bool {
+    hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// Serve a blob by hash with correct Content-Type.

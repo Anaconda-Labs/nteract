@@ -99,6 +99,7 @@ mod workstation_attachment;
 
 pub(crate) use attachments::*;
 pub(crate) use catalog::*;
+pub(crate) use hosted_bridge::HostedBlobSource;
 pub use hosted_bridge::HostedBridgeHandle;
 pub(crate) use hosted_bridge::*;
 pub(crate) use identity::*;

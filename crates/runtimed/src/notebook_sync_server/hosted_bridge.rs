@@ -75,12 +75,100 @@ pub struct HostedBridgeHandle {
     request_tx: mpsc::Sender<Vec<u8>>,
     task: tokio::task::JoinHandle<()>,
     idle_task: Option<tokio::task::JoinHandle<()>>,
+    /// Cloud origin and credential for reading the hosted notebook's blobs.
+    /// Output manifests synced from the hosted room reference blobs that live
+    /// in the cloud blob store, not the local one.
+    blob_source: Option<HostedBlobSource>,
     /// Keeps the bridged room resident (`reservations > 0`) while the bridge
     /// is live. Idle teardown drops the handle so normal room eviction applies.
     _reservation: super::ReservationGuard,
 }
 
+/// Where a bridged room's blobs can be read from on the cloud side.
+pub(crate) struct HostedBlobSource {
+    pub cloud_url: String,
+    pub auth: notebook_cloud_transport::CloudAuth,
+}
+
 impl HostedBridgeHandle {
+    pub(crate) fn with_blob_source(mut self, source: HostedBlobSource) -> Self {
+        self.blob_source = Some(source);
+        self
+    }
+
+    /// Fetch blob `hash` from the hosted notebook into `store`. Returns
+    /// `true` when the blob is now present locally. The bytes are only stored
+    /// when their SHA-256 matches `hash`, so a wrong or tampered response
+    /// cannot poison the content-addressed store.
+    pub(crate) async fn fetch_blob(
+        &self,
+        client: &reqwest::Client,
+        hash: &str,
+        store: &crate::blob_store::BlobStore,
+    ) -> bool {
+        use sha2::{Digest, Sha256};
+
+        let Some(source) = &self.blob_source else {
+            return false;
+        };
+        let url = crate::output_blob_publisher::blob_upload_url(
+            &source.cloud_url,
+            &self.hosted_notebook_id,
+            hash,
+        );
+        let request =
+            crate::output_blob_publisher::apply_auth_headers(client.get(&url), &source.auth);
+        let response = match request.send().await {
+            Ok(response) if response.status().is_success() => response,
+            Ok(response) => {
+                debug!(
+                    "[hosted-bridge] blob {hash} not available from {}: {}",
+                    self.locator,
+                    response.status()
+                );
+                return false;
+            }
+            Err(error) => {
+                warn!(
+                    "[hosted-bridge] blob {hash} fetch from {} failed: {error}",
+                    self.locator
+                );
+                return false;
+            }
+        };
+        let media_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("application/octet-stream")
+            .to_string();
+        let bytes = match response.bytes().await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                warn!(
+                    "[hosted-bridge] blob {hash} body from {} failed: {error}",
+                    self.locator
+                );
+                return false;
+            }
+        };
+        let actual = hex::encode(Sha256::digest(&bytes));
+        if actual != hash {
+            warn!(
+                "[hosted-bridge] blob {hash} from {} hashed to {actual}; discarded",
+                self.locator
+            );
+            return false;
+        }
+        match store.put(&bytes, &media_type).await {
+            Ok(_) => true,
+            Err(error) => {
+                warn!("[hosted-bridge] storing blob {hash} failed: {error}");
+                false
+            }
+        }
+    }
+
     /// The authenticated cloud principal, once the first connect has observed
     /// `cloud_room_ready`.
     pub fn principal(&self) -> Option<String> {
@@ -184,6 +272,7 @@ pub(crate) fn spawn_hosted_bridge(
         request_tx,
         task,
         idle_task,
+        blob_source: None,
         _reservation: reservation,
     }
 }
