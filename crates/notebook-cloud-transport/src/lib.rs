@@ -237,8 +237,9 @@ fn decode_frame(data: &[u8]) -> Option<TypedNotebookFrame> {
 /// Classification of a `SESSION_CONTROL` frame seen while waiting for the room
 /// to become ready.
 enum ReadyControl {
-    /// `cloud_room_ready` carrying the room principal.
-    Ready(String),
+    /// `cloud_room_ready` carrying the room principal and, when present, the
+    /// connection scope the room granted.
+    Ready(String, Option<String>),
     /// `cloud_frame_rejected` carrying the room's stated reason.
     Rejected(String),
     /// Any other control frame (e.g. `cloud_frame_accepted`, presence) — not
@@ -266,7 +267,11 @@ fn classify_ready_control(payload: &[u8]) -> ReadyControl {
             if principal.is_empty() {
                 ReadyControl::Other
             } else {
-                ReadyControl::Ready(principal.to_string())
+                let scope = control
+                    .get("connection_scope")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                ReadyControl::Ready(principal.to_string(), scope)
             }
         }
         Some("cloud_frame_rejected") => {
@@ -416,12 +421,12 @@ pub fn cloud_close_is_graceful_shutdown(error: &std::io::Error) -> bool {
 async fn wait_for_ready<S: FrameSource>(
     source: &mut S,
     buffered: &mut VecDeque<TypedNotebookFrame>,
-) -> std::io::Result<String> {
+) -> std::io::Result<(String, Option<String>)> {
     loop {
         match source.recv_frame().await {
             Some(Ok(frame)) if frame.frame_type as u8 == SESSION_CONTROL => {
                 match classify_ready_control(&frame.payload) {
-                    ReadyControl::Ready(principal) => return Ok(principal),
+                    ReadyControl::Ready(principal, scope) => return Ok((principal, scope)),
                     ReadyControl::Rejected(reason) => {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::PermissionDenied,
@@ -454,7 +459,7 @@ async fn wait_for_ready<S: FrameSource>(
 #[cfg(test)]
 fn principal_from_cloud_room_ready(payload: &[u8]) -> Option<String> {
     match classify_ready_control(payload) {
-        ReadyControl::Ready(principal) => Some(principal),
+        ReadyControl::Ready(principal, _) => Some(principal),
         _ => None,
     }
 }
@@ -570,6 +575,10 @@ pub struct CloudWsFrameTransport {
     /// Principal from the most recent `cloud_room_ready`. Set on first connect;
     /// reconnects to the same room re-observe the same principal.
     principal: Arc<std::sync::OnceLock<String>>,
+    /// Connection scope granted by the most recent `cloud_room_ready`. Unlike
+    /// the principal this can change between connects (an ACL edit, or a room
+    /// that downgrades a requested scope), so it tracks the latest value.
+    granted_scope: Arc<std::sync::Mutex<Option<String>>>,
     /// Optional per-connect token refresher. `None` keeps the static token from
     /// `config.auth`. When set, `connect` calls it before each dial and re-auths
     /// with the returned token so a long-lived peer survives token expiry across
@@ -585,6 +594,7 @@ impl CloudWsFrameTransport {
             config,
             ws_url,
             principal: Arc::new(std::sync::OnceLock::new()),
+            granted_scope: Arc::new(std::sync::Mutex::new(None)),
             refresher: None,
         }
     }
@@ -599,6 +609,7 @@ impl CloudWsFrameTransport {
             config,
             ws_url,
             principal: Arc::new(std::sync::OnceLock::new()),
+            granted_scope: Arc::new(std::sync::Mutex::new(None)),
             refresher: Some(refresher),
         }
     }
@@ -613,6 +624,17 @@ impl CloudWsFrameTransport {
     /// RuntimeStateDoc under `<principal>/<operator>`.
     pub fn principal(&self) -> Option<&str> {
         self.principal.get().map(String::as_str)
+    }
+
+    /// The connection scope the room granted on the most recent connect, as
+    /// reported in `cloud_room_ready` (`owner`, `editor`, `viewer`, or
+    /// `runtime_peer`). It can be lower than the requested
+    /// [`CloudWsConfig::scope`] when the room downgrades a live connection.
+    pub fn granted_scope(&self) -> Option<String> {
+        self.granted_scope
+            .lock()
+            .ok()
+            .and_then(|scope| scope.clone())
     }
 
     /// Resolve the credential to present on the next connect: the refresher's
@@ -727,7 +749,9 @@ impl CloudWsFrameTransport {
     /// Dial + auth + split + wait for `cloud_room_ready`, returning the halves
     /// and the room principal. The [`FrameTransport::connect`] impl delegates
     /// here and caches the principal.
-    async fn connect_cloud(&self) -> std::io::Result<(CloudWsSource, CloudWsSink, String)> {
+    async fn connect_cloud(
+        &self,
+    ) -> std::io::Result<(CloudWsSource, CloudWsSink, String, Option<String>)> {
         let auth = self.effective_auth().await?;
         let mut request = self
             .ws_url
@@ -770,7 +794,7 @@ impl CloudWsFrameTransport {
         // blocks. Data frames that arrive before ready are buffered in
         // `source.pending` and replayed to the agent after the handshake.
         let mut buffered = VecDeque::new();
-        let principal = match tokio::time::timeout(
+        let (principal, granted_scope) = match tokio::time::timeout(
             READY_WAIT_TIMEOUT,
             wait_for_ready(&mut source, &mut buffered),
         )
@@ -789,9 +813,12 @@ impl CloudWsFrameTransport {
         };
         source.pending = buffered;
 
-        info!("[cloud-transport] room ready; principal={principal}");
+        info!(
+            "[cloud-transport] room ready; principal={principal} scope={}",
+            granted_scope.as_deref().unwrap_or("(unreported)")
+        );
         let sink = CloudWsSink { sink };
-        Ok((source, sink, principal))
+        Ok((source, sink, principal, granted_scope))
     }
 }
 
@@ -818,7 +845,10 @@ impl FrameTransport for CloudWsFrameTransport {
     }
 
     async fn connect(&self) -> std::io::Result<(Self::Source, Self::Sink)> {
-        let (source, sink, principal) = self.connect_cloud().await?;
+        let (source, sink, principal, granted_scope) = self.connect_cloud().await?;
+        if let Ok(mut slot) = self.granted_scope.lock() {
+            *slot = granted_scope;
+        }
         // Cache the principal for `Self::principal`. Reconnects to the same room
         // with the same credential re-observe the same principal, so a failed
         // set (already-initialised) is normally expected. If a reconnect sees a
@@ -924,6 +954,23 @@ mod tests {
             .expect("known type, empty payload");
         assert_eq!(decoded.frame_type, NotebookFrameType::RuntimeStateSync);
         assert!(decoded.payload.is_empty());
+    }
+
+    #[test]
+    fn granted_scope_parsed_from_cloud_room_ready() {
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "type": "cloud_room_ready",
+            "actor_label": "user:local:dev%40localhost/desktop:a1",
+            "connection_scope": "owner",
+        }))
+        .unwrap();
+        match classify_ready_control(&payload) {
+            ReadyControl::Ready(principal, scope) => {
+                assert_eq!(principal, "user:local:dev%40localhost");
+                assert_eq!(scope.as_deref(), Some("owner"));
+            }
+            _ => panic!("cloud_room_ready must classify as Ready"),
+        }
     }
 
     #[test]
@@ -1511,8 +1558,12 @@ mod tests {
             }))),
         ]);
         let mut buffered = VecDeque::new();
-        let principal = wait_for_ready(&mut source, &mut buffered).await.unwrap();
+        let (principal, scope) = wait_for_ready(&mut source, &mut buffered).await.unwrap();
         assert_eq!(principal, "anaconda:alice");
+        assert_eq!(
+            scope, None,
+            "a ready frame without connection_scope reports none"
+        );
         assert_eq!(buffered.len(), 1, "pre-ready data frame is buffered");
         assert_eq!(buffered[0].payload, b"early sync bytes");
     }
@@ -1565,7 +1616,7 @@ mod tests {
 
         // And the connect-time mapping turns that elapsed into a TimedOut io
         // error (the shape `reconnect_with_backoff` treats as a failed connect).
-        let mapped: std::io::Result<String> = match result {
+        let mapped: std::io::Result<(String, Option<String>)> = match result {
             Ok(inner) => inner,
             Err(_elapsed) => Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,

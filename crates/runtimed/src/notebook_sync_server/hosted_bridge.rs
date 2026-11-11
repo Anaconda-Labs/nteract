@@ -33,6 +33,7 @@ use notebook_cloud_transport::CloudWsFrameTransport;
 use notebook_doc::diff::diff_metadata_touched;
 use notebook_protocol::connection::{FrameSink, FrameSource, FrameTransport};
 use notebook_wire::{HostedBridgeStatusWire, NotebookFrameType};
+use nteract_identity::ConnectionScope;
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
 
@@ -70,6 +71,7 @@ pub struct HostedBridgeHandle {
     /// Hosted notebook id (ULID) on the cloud domain.
     pub hosted_notebook_id: String,
     principal_rx: watch::Receiver<Option<String>>,
+    granted_scope_rx: watch::Receiver<Option<ConnectionScope>>,
     request_tx: mpsc::Sender<Vec<u8>>,
     task: tokio::task::JoinHandle<()>,
     idle_task: Option<tokio::task::JoinHandle<()>>,
@@ -99,6 +101,20 @@ impl HostedBridgeHandle {
                 // Bridge task dropped its sender or we timed out.
                 Ok(Err(_)) | Err(_) => return None,
             }
+        }
+    }
+
+    /// Scope for local peers of the bridged room: the scope the hosted room
+    /// granted the bridge on its latest connect. Local peers must not exceed
+    /// it, and the hosted room re-checks every forwarded request regardless.
+    /// Falls back to editor when the room reported no usable scope.
+    pub fn local_peer_scope(&self) -> ConnectionScope {
+        match *self.granted_scope_rx.borrow() {
+            Some(
+                scope
+                @ (ConnectionScope::Owner | ConnectionScope::Editor | ConnectionScope::Viewer),
+            ) => scope,
+            _ => ConnectionScope::Editor,
         }
     }
 
@@ -133,6 +149,7 @@ pub(crate) fn spawn_hosted_bridge(
     options: HostedBridgeOptions,
 ) -> HostedBridgeHandle {
     let (principal_tx, principal_rx) = watch::channel(None);
+    let (granted_scope_tx, granted_scope_rx) = watch::channel(None);
     let (request_tx, request_rx) = mpsc::channel(FORWARD_QUEUE_CAPACITY);
     let room_id = room.id;
     let task_locator = locator.clone();
@@ -148,13 +165,22 @@ pub(crate) fn spawn_hosted_bridge(
         })
     });
     let task = tokio::spawn(async move {
-        run_bridge(room, transport, task_locator, principal_tx, request_rx).await;
+        run_bridge(
+            room,
+            transport,
+            task_locator,
+            principal_tx,
+            granted_scope_tx,
+            request_rx,
+        )
+        .await;
     });
     HostedBridgeHandle {
         room_id,
         locator,
         hosted_notebook_id,
         principal_rx,
+        granted_scope_rx,
         request_tx,
         task,
         idle_task,
@@ -205,6 +231,7 @@ async fn run_bridge(
     transport: CloudWsFrameTransport,
     locator: String,
     principal_tx: watch::Sender<Option<String>>,
+    granted_scope_tx: watch::Sender<Option<ConnectionScope>>,
     mut request_rx: mpsc::Receiver<Vec<u8>>,
 ) {
     let mut backoff = BACKOFF_INITIAL;
@@ -238,14 +265,22 @@ async fn run_bridge(
                     backoff = (backoff * 2).min(BACKOFF_MAX);
                     continue;
                 };
+                // Publish the scope before the principal: callers wait on the
+                // principal and then read the scope.
+                let granted_scope = transport
+                    .granted_scope()
+                    .and_then(|scope| scope.parse::<ConnectionScope>().ok());
+                let _ = granted_scope_tx.send(granted_scope);
                 let _ = principal_tx.send(Some(principal.clone()));
                 connected_once = true;
                 room.broadcasts
                     .hosted_bridge_status_tx
                     .send_replace(HostedBridgeStatusWire::Connected);
                 info!(
-                    "[hosted-bridge] {} attached as principal {}",
-                    locator, principal
+                    "[hosted-bridge] {} attached as principal {} with scope {}",
+                    locator,
+                    principal,
+                    granted_scope.map_or("(unreported)", ConnectionScope::as_str)
                 );
                 match run_connection(&room, &locator, source, sink, &mut request_rx).await {
                     Err(error) => {
@@ -922,6 +957,11 @@ mod tests {
 
         let principal = bridge.wait_for_principal(Duration::from_secs(10)).await;
         assert_eq!(principal.as_deref(), Some(CLOUD_PRINCIPAL));
+        assert_eq!(
+            bridge.local_peer_scope(),
+            ConnectionScope::Editor,
+            "local peers inherit the scope the hosted room granted the bridge"
+        );
         assert_eq!(
             *room.broadcasts.hosted_bridge_status_tx.borrow(),
             HostedBridgeStatusWire::Connected

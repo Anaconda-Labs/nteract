@@ -3671,7 +3671,7 @@ impl Daemon {
                     // cloud open` created). Its peers must author under the
                     // cloud principal, like OpenHostedNotebook peers, or the
                     // hosted room rejects their changes.
-                    let Some(principal) = self.hosted_bridge_principal(room.id).await else {
+                    let Some((principal, scope)) = self.hosted_bridge_access(room.id).await else {
                         let mut writer = writer;
                         send_error_response(
                             &mut writer,
@@ -3682,9 +3682,7 @@ impl Daemon {
                         return Ok(());
                     };
                     crate::notebook_sync_server::RoomConnectionIdentity::hosted_bridged(
-                        &principal,
-                        operator,
-                        nteract_identity::ConnectionScope::Editor,
+                        &principal, operator, scope,
                     )?
                 } else {
                     let connection_scope =
@@ -4006,7 +4004,11 @@ impl Daemon {
                     notebook_cloud_transport::CloudWsConfig {
                         cloud_url: domain_config.base_url.clone(),
                         notebook_id: hosted_id.clone(),
-                        scope: "editor".to_string(),
+                        // Ask for the most the credential may hold. The hosted
+                        // room downgrades a live connection to editor or viewer
+                        // when its ACL grants less, reports the result in
+                        // cloud_room_ready, and local peers inherit that scope.
+                        scope: "owner".to_string(),
                         auth,
                         workstation: None,
                     },
@@ -4026,9 +4028,13 @@ impl Daemon {
         Ok((room, bridge, connection_reservation))
     }
 
-    /// Cloud principal of the hosted bridge serving `room_id`, waiting briefly
-    /// for a bridge that has not finished its first connect.
-    async fn hosted_bridge_principal(&self, room_id: uuid::Uuid) -> Option<String> {
+    /// Cloud principal and local peer scope of the hosted bridge serving
+    /// `room_id`, waiting briefly for a bridge that has not finished its first
+    /// connect.
+    async fn hosted_bridge_access(
+        &self,
+        room_id: uuid::Uuid,
+    ) -> Option<(String, nteract_identity::ConnectionScope)> {
         let bridge = {
             let bridges = self.hosted_bridges.lock().await;
             bridges
@@ -4036,9 +4042,10 @@ impl Daemon {
                 .find(|bridge| bridge.room_id == room_id)
                 .cloned()
         }?;
-        bridge
+        let principal = bridge
             .wait_for_principal(std::time::Duration::from_secs(30))
-            .await
+            .await?;
+        Some((principal, bridge.local_peer_scope()))
     }
 
     /// Handle an OpenHostedNotebook connection: attach (or reuse) the hosted
@@ -4096,7 +4103,7 @@ impl Daemon {
             match crate::notebook_sync_server::RoomConnectionIdentity::hosted_bridged(
                 &principal,
                 operator,
-                nteract_identity::ConnectionScope::Editor,
+                bridge.local_peer_scope(),
             ) {
                 Ok(identity) => identity,
                 Err(e) => {

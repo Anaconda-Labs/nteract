@@ -186,7 +186,9 @@ async fn serve_fake_cloud_room(
         seen.take().expect("fake room should observe WS handshake")
     };
     assert_eq!(handshake.path, expected_path);
-    assert_eq!(handshake.scope.as_deref(), Some("editor"));
+    // The bridge requests owner; this fake room grants editor below, the way
+    // a real room downgrades a principal whose ACL covers less.
+    assert_eq!(handshake.scope.as_deref(), Some("owner"));
     assert_eq!(handshake.token.as_deref(), Some("dev-secret"));
     assert_eq!(handshake.user.as_deref(), Some("kyle"));
 
@@ -363,6 +365,11 @@ credential = {{ kind = "dev-token-env", env = "NTERACT_E2E_HOSTED_DEV_TOKEN", us
     assert!(
         actor_label.contains("desktop:e2e"),
         "actor label should include local operator: {actor_label}"
+    );
+    assert_eq!(
+        result.info.capabilities.connection_scope.as_deref(),
+        Some("editor"),
+        "local peers get the scope the hosted room granted, not the requested owner"
     );
     assert!(result.info.ephemeral);
 
